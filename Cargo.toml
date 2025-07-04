@@ -1,0 +1,10 @@
+[package]
+name = "proconwatch"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+notify-debouncer-mini = "0.6.0"
+similar = "2.7"

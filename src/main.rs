@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to watch {:?}", test_runner.root_directory))?;
     for res in rx {
         let path = &res?[0].path;
-        if !path.try_exists()? || !path.is_file() {
+        if !path.try_exists()? || !path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
             continue;
         }
         Log::Modified(path.clone()).print();

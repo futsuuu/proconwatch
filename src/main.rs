@@ -1,10 +1,10 @@
-use std::io::Write as _;
-
 use anyhow::Context as _;
-use crossterm::style::Stylize as _;
+use crossterm::style::Stylize;
 use notify_debouncer_mini::notify;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let test_runner = TestRunner::new()?;
     let (tx, rx) = std::sync::mpsc::channel();
     let debounce_timeout = std::time::Duration::from_millis(300);
@@ -27,14 +27,16 @@ fn main() -> anyhow::Result<()> {
         };
         match kind {
             FileKind::SourceCode => {
-                test_runner.run_after_compiling(path)?;
+                test_runner.run_after_compiling(path).await?;
             }
             FileKind::TestCase => {
                 let Some(source) = get_source_code(path)? else {
                     Log::SourceCodeNotFound(path.to_path_buf()).print();
                     continue;
                 };
-                test_runner.run_only_one_test_case(&source, TestCase::read(path)?)?;
+                test_runner
+                    .run_only_one_test_case(&source, TestCase::read(path)?)
+                    .await?;
             }
         }
     }
@@ -60,7 +62,7 @@ impl TestRunner {
         })
     }
 
-    fn run_only_one_test_case(
+    async fn run_only_one_test_case(
         &self,
         source: &std::path::Path,
         case: TestCase,
@@ -70,48 +72,77 @@ impl TestRunner {
             return Ok(());
         }
         Log::Testing(source.to_path_buf()).print();
-        self.run_test(&exe_path, case)?;
+        self.run_test(&exe_path, case).await?;
         Ok(())
     }
 
-    fn run_after_compiling(&self, source: &std::path::Path) -> anyhow::Result<()> {
+    async fn run_after_compiling(&self, source: &std::path::Path) -> anyhow::Result<()> {
         let exe_path = self.get_exe_path(source);
         if !compile_cpp(source, &exe_path)? {
             return Ok(());
         }
         Log::Testing(source.to_path_buf()).print();
         for case in get_test_cases(source)? {
-            self.run_test(&exe_path, case)?;
+            self.run_test(&exe_path, case).await?;
         }
         Ok(())
     }
 
-    fn run_test(&self, exe_path: &std::path::Path, case: TestCase) -> anyhow::Result<()> {
+    async fn run_test(&self, exe_path: &std::path::Path, case: TestCase) -> anyhow::Result<()> {
         if !exe_path.try_exists()? {
             return Ok(());
         }
-        let mut child = std::process::Command::new(exe_path)
+        let mut child = tokio::process::Command::new(exe_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn {exe_path:?}"))?;
-        let mut stdin = child.stdin.take().context("cannot take stdin")?;
-        stdin
+        let cstdout = child.stdout.take().context("could not take stdout")?;
+        // let cstderr = child.stderr.take().context("could not take stderr")?;
+        let mut cstdin = child.stdin.take().context("could not take stdin")?;
+
+        cstdin
             .write_all(case.input.as_bytes())
+            .await
             .context("failed to write into stdin")?;
-        let output = child.wait_with_output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout)
-            .replace("\r\n", "\n")
-            .replace("\r", "\n");
+
+        let mut stdout_rx = create_line_rx(tokio::io::BufReader::new(cstdout));
+        // let mut stderr_rx = create_line_rx(tokio::io::BufReader::new(cstderr));
+        let time_limit = std::time::Duration::from_secs(3);
+        let wait_result = tokio::time::timeout(time_limit, child.wait()).await;
+        let mut stdout_bytes = Vec::new();
+        while let Some(res) = stdout_rx.recv().await {
+            let mut res = res?;
+            if res.get(res.len() - 2..) == Some(b"\r\n") {
+                res.pop();
+                *res.last_mut().unwrap() = b'\n';
+            }
+            stdout_bytes.extend(res);
+        }
+        let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+        let Ok(exit_status) = wait_result else {
+            child.kill().await?;
+            Log::TestResult(TestResult::TimeLimitExceeded { stdout }).print();
+            return Ok(());
+        };
+        let status = exit_status.with_context(|| format!("failed to execute {exe_path:?}"))?;
+        if !status.success() {
+            Log::TestResult(TestResult::ExecutionFailed { stdout, status }).print();
+            return Ok(());
+        }
         if let Some(expected_output) = case.output {
-            if stdout == expected_output {
-                Log::TestResult(Ok(None)).print();
+            if stdout_bytes == expected_output.as_bytes() {
+                Log::TestResult(TestResult::AssertionSucceeded).print();
             } else {
-                Log::TestResult(Err((expected_output, stdout))).print();
+                Log::TestResult(TestResult::AssertionFailed {
+                    expected: expected_output,
+                    actual: stdout,
+                })
+                .print();
             }
         } else {
-            Log::TestResult(Ok(Some(stdout))).print();
+            Log::TestResult(TestResult::ExecutionSucceeded { stdout }).print();
         }
         Ok(())
     }
@@ -121,6 +152,42 @@ impl TestRunner {
         exe_path.set_extension(std::env::consts::EXE_EXTENSION);
         exe_path
     }
+}
+
+fn create_line_rx<R>(mut r: R) -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        loop {
+            let res = match r.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => Ok(std::mem::take(&mut buf)),
+                Err(e) => Err(e),
+            };
+            if tx.send(res).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[tokio::test]
+async fn test_line_receiver() {
+    let mut rx = create_line_rx(std::io::Cursor::new("hello\nworld\n!"));
+    assert_eq!(
+        "hello\n".as_bytes().to_vec(),
+        rx.recv().await.unwrap().unwrap()
+    );
+    assert_eq!(
+        "world\n".as_bytes().to_vec(),
+        rx.recv().await.unwrap().unwrap()
+    );
+    assert_eq!("!".as_bytes().to_vec(), rx.recv().await.unwrap().unwrap());
+    assert!(rx.recv().await.is_none());
 }
 
 fn get_source_code(test_case_path: &std::path::Path) -> anyhow::Result<Option<std::path::PathBuf>> {
@@ -300,7 +367,25 @@ enum Log {
     Compiling(std::path::PathBuf),
     CompileResult(Result<Option<String>, String>),
     Testing(std::path::PathBuf),
-    TestResult(Result<Option<String>, (String, String)>),
+    TestResult(TestResult),
+}
+
+enum TestResult {
+    ExecutionSucceeded {
+        stdout: String,
+    },
+    ExecutionFailed {
+        stdout: String,
+        status: std::process::ExitStatus,
+    },
+    TimeLimitExceeded {
+        stdout: String,
+    },
+    AssertionSucceeded,
+    AssertionFailed {
+        expected: String,
+        actual: String,
+    },
 }
 
 impl Log {
@@ -311,7 +396,11 @@ impl Log {
                 println!("{}", Self::format_path(p));
             }
             Log::SourceCodeNotFound(p) => {
-                println!("=== {}{}", "Cannot detect source code of ".dark_yellow().bold(), Self::format_path(p));
+                println!(
+                    "=== {}{}",
+                    "Could not detect source code of ".dark_yellow().bold(),
+                    Self::format_path(p)
+                );
             }
             Log::Compiling(p) => {
                 print!(" {} ", "Compiling".cyan());
@@ -334,22 +423,27 @@ impl Log {
                 println!("{}...", Self::format_path(p));
             }
             Log::TestResult(r) => match r {
-                Ok(None) => {
+                TestResult::ExecutionSucceeded { stdout } => {
+                    println!("=== {}", "Execution Succeeded".dark_green().bold());
+                    Self::format_output(stdout, None);
+                }
+                TestResult::ExecutionFailed { stdout, status } => {
+                    println!("=== {}", "Execution Failed".dark_red().bold());
+                    println!(" status: {status}");
+                    Self::format_output(stdout, None);
+                }
+                TestResult::TimeLimitExceeded { stdout } => {
+                    println!("=== {}", "Time Limit Exceeded".dark_red().bold());
+                    Self::format_output(stdout, None);
+                }
+                TestResult::AssertionSucceeded => {
                     println!("=== {}", "Assertion Succeeded".dark_green().bold());
                 }
-                Ok(Some(output)) => {
-                    println!("=== {}", "Execution Succeeded".dark_green().bold());
-                    println!(" output:");
-                    for line in output.lines() {
-                        println!("  │{line}");
-                    }
-                    println!();
-                }
-                Err((expected, actual)) => {
+                TestResult::AssertionFailed { expected, actual } => {
                     println!("=== {}", "Assertion Failed".dark_red().bold());
-                    Self::diff(expected, actual);
-                },
-            }
+                    Self::format_output(actual, Some(expected));
+                }
+            },
         }
     }
 
@@ -357,29 +451,40 @@ impl Log {
         format!("'{}'", p.to_string_lossy()).magenta().to_string()
     }
 
-    fn diff(expected: &str, actual: &str) {
-        let diff = similar::TextDiff::from_lines(expected, actual);
-        let mut exp = String::from(" expected:\n");
-        let mut act = String::from(" actual:\n");
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                similar::ChangeTag::Equal => {
-                    exp += "  │";
-                    exp += change.as_str().unwrap();
-                    act += "  │";
-                    act += change.as_str().unwrap();
-                }
-                similar::ChangeTag::Delete => {
-                    exp += &"  ┃".dark_red().to_string();
-                    exp += &change.as_str().unwrap().dark_red().bold().to_string();
-                }
-                similar::ChangeTag::Insert => {
-                    act += &"  ┃".dark_green().to_string();
-                    act += &change.as_str().unwrap().dark_green().bold().to_string();
+    fn format_output(output: &str, diff_with_expected: Option<&str>) {
+        let indent = "  │";
+        let indent_bold = "  ┃";
+        if let Some(expected) = diff_with_expected {
+            let diff = similar::TextDiff::from_lines(expected, output);
+            let mut exp = String::from(" expected:\n");
+            let mut act = String::from(" actual:\n");
+            for change in diff.iter_all_changes() {
+                match change.tag() {
+                    similar::ChangeTag::Equal => {
+                        exp += indent;
+                        exp += change.as_str().unwrap();
+                        act += indent;
+                        act += change.as_str().unwrap();
+                    }
+                    similar::ChangeTag::Delete => {
+                        exp += &indent_bold.dark_red().to_string();
+                        exp += &change.as_str().unwrap().dark_red().bold().to_string();
+                    }
+                    similar::ChangeTag::Insert => {
+                        act += &indent_bold.dark_green().to_string();
+                        act += &change.as_str().unwrap().dark_green().bold().to_string();
+                    }
                 }
             }
+            println!("{exp}");
+            println!("{act}");
+        } else {
+            let mut out = String::from(" stdout:\n");
+            for line in output.lines() {
+                out += line;
+                out += "\n";
+            }
+            println!("{out}");
         }
-        println!("{exp}");
-        println!("{act}");
     }
 }

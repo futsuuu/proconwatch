@@ -26,12 +26,12 @@ async fn main() -> anyhow::Result<()> {
             continue;
         };
         match kind {
-            FileKind::SourceCode => {
+            FileKind::Source => {
                 test_runner.run_after_compiling(path).await?;
             }
             FileKind::TestCase => {
-                let Some(source) = get_source_code(path)? else {
-                    Log::SourceCodeNotFound(path.to_path_buf()).print();
+                let Some(source) = get_source_file(path)? else {
+                    Log::SourceNotFound(path.to_path_buf()).print();
                     continue;
                 };
                 test_runner
@@ -190,53 +190,123 @@ async fn test_line_receiver() {
     assert!(rx.recv().await.is_none());
 }
 
-fn get_source_code(test_case_path: &std::path::Path) -> anyhow::Result<Option<std::path::PathBuf>> {
+fn get_source_file(test_case: &std::path::Path) -> anyhow::Result<Option<std::path::PathBuf>> {
     let mut paths = Vec::new();
-    let dir = test_case_path.parent().unwrap();
+    let dir = test_case.parent().unwrap();
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("failed to read directory {dir:?}"))?
     {
         let entry = entry?;
-        if entry.path().extension().and_then(FileKind::from_extension) == Some(FileKind::SourceCode)
-        {
-            let p = entry.path();
-            let stem = p.file_stem().unwrap().to_str().unwrap().to_string();
-            paths.push((p, stem));
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry.path().extension().and_then(FileKind::from_extension) == Some(FileKind::Source) {
+            paths.push(entry.path());
         }
     }
-    let mut name = test_case_path
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    while 2 <= paths.len() {
-        paths.retain(|p| p.1.starts_with(&name));
-        name.pop();
+    Ok(filter_source_file(paths, test_case))
+}
+
+fn filter_source_file(
+    sources: Vec<std::path::PathBuf>,
+    test_case: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut sources: Vec<_> = sources
+        .into_iter()
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            Some((p, stem))
+        })
+        .collect();
+    let test_case_name = test_case.file_stem()?.to_str()?.to_string();
+    for prefix in (1..).map_while(|i| test_case_name.get(..i)) {
+        sources.retain(|p| p.1.starts_with(prefix));
+        if sources.len() <= 1 {
+            return sources.pop().map(|p| p.0);
+        }
     }
-    Ok(paths.pop().map(|t| t.0))
+    None
+}
+
+#[test]
+fn test_filter_source_file() {
+    assert_eq!(
+        Some("foo/cd.cpp".into()),
+        filter_source_file(
+            vec![
+                "foo/ab.cpp".into(),
+                "foo/bc.cpp".into(),
+                "foo/cd.cpp".into(),
+                "foo/de.cpp".into(),
+            ],
+            std::path::Path::new("foo/cd2.io"),
+        )
+    );
+    assert_eq!(
+        None,
+        filter_source_file(
+            vec!["foo/abc.cpp".into(), "foo/abd.cpp".into()],
+            std::path::Path::new("foo/ab.io"),
+        )
+    );
 }
 
 fn get_test_cases(source: &std::path::Path) -> anyhow::Result<Vec<TestCase>> {
-    let stem = source.file_stem().unwrap().to_str().unwrap();
-    let mut v = Vec::new();
+    let mut paths = Vec::new();
     let dir = source.parent().unwrap();
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("failed to read directory {dir:?}"))?
     {
         let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
         if entry.path().extension().and_then(FileKind::from_extension) != Some(FileKind::TestCase) {
             continue;
         }
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|s| s.starts_with(stem))
-        {
-            v.push(TestCase::read(&entry.path())?);
-        }
+        paths.push(entry.path());
     }
-    Ok(v)
+    filter_test_cases(paths, source)
+        .into_iter()
+        .map(|p| TestCase::read(&p))
+        .collect()
+}
+
+fn filter_test_cases(
+    test_cases: Vec<std::path::PathBuf>,
+    source: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let Some(prefix) = source.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    test_cases
+        .into_iter()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with(prefix))
+        })
+        .collect()
+}
+
+#[test]
+fn test_filter_test_cases() {
+    assert_eq!(
+        vec![
+            std::path::PathBuf::from("foo/bar.io"),
+            "foo/bar0.io".into(),
+            "foo/bar1.io".into(),
+        ],
+        filter_test_cases(
+            vec![
+                "foo/bar.io".into(),
+                "foo/bar0.io".into(),
+                "foo/bar1.io".into(),
+                "foo/baz.io".into(),
+            ],
+            std::path::Path::new("foo/bar.cpp"),
+        ),
+    );
 }
 
 fn compile_cpp(source: &std::path::Path, out: &std::path::Path) -> anyhow::Result<bool> {
@@ -263,14 +333,14 @@ fn compile_cpp(source: &std::path::Path, out: &std::path::Path) -> anyhow::Resul
 
 #[derive(Debug, PartialEq, Eq)]
 enum FileKind {
-    SourceCode,
+    Source,
     TestCase,
 }
 
 impl FileKind {
     fn from_extension(ext: &std::ffi::OsStr) -> Option<Self> {
         match ext.to_str()? {
-            "c++" | "cpp" | "cxx" => Some(Self::SourceCode),
+            "c++" | "cpp" | "cxx" => Some(Self::Source),
             "io" => Some(Self::TestCase),
             _ => None,
         }
@@ -363,7 +433,7 @@ HELLO WORLD
 
 enum Log {
     Modified(std::path::PathBuf),
-    SourceCodeNotFound(std::path::PathBuf),
+    SourceNotFound(std::path::PathBuf),
     Compiling(std::path::PathBuf),
     CompileResult(Result<Option<String>, String>),
     Testing(std::path::PathBuf),
@@ -395,10 +465,10 @@ impl Log {
                 print!("  {} ", "Modified".grey());
                 println!("{}", Self::format_path(p));
             }
-            Log::SourceCodeNotFound(p) => {
+            Log::SourceNotFound(p) => {
                 println!(
                     "=== {}{}",
-                    "Could not detect source code of ".dark_yellow().bold(),
+                    "Could not detect source file of ".dark_yellow().bold(),
                     Self::format_path(p)
                 );
             }

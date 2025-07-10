@@ -1,23 +1,18 @@
 use anyhow::Context as _;
-use crossterm::style::Stylize;
-use notify_debouncer_mini::notify;
+use crossterm::style::Stylize as _;
+use notify::Watcher as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let test_runner = TestRunner::new()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let debounce_timeout = std::time::Duration::from_millis(300);
-    let mut debouncer = notify_debouncer_mini::new_debouncer(debounce_timeout, tx)?;
-    debouncer
-        .watcher()
-        .watch(
-            &test_runner.root_directory,
-            notify::RecursiveMode::NonRecursive,
-        )
-        .with_context(|| format!("failed to watch {:?}", test_runner.root_directory))?;
-    for res in rx {
-        let path = &res?[0].path;
+    let mut modified_path_rx = watch_throttled(
+        &test_runner.root_directory,
+        std::time::Duration::from_millis(500),
+    )?;
+
+    while let Some(path) = modified_path_rx.recv().await {
+        let path = path?;
         if !path.try_exists()? || !path.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
             continue;
         }
@@ -27,20 +22,63 @@ async fn main() -> anyhow::Result<()> {
         };
         match kind {
             FileKind::Source => {
-                test_runner.run_after_compiling(path).await?;
+                test_runner.run_after_compiling(&path).await?;
             }
             FileKind::TestCase => {
-                let Some(source) = get_source_file(path)? else {
+                let Some(source) = get_source_file(&path)? else {
                     Log::SourceNotFound(path.to_path_buf()).print();
                     continue;
                 };
                 test_runner
-                    .run_only_one_test_case(&source, TestCase::read(path)?)
+                    .run_only_one_test_case(&source, TestCase::read(&path)?)
                     .await?;
             }
         }
     }
     Ok(())
+}
+
+fn watch_throttled(
+    dir: &std::path::Path,
+    min_interval: std::time::Duration,
+) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<notify::Result<std::path::PathBuf>>> {
+    let (tx_raw, rx_raw) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(tx_raw)?;
+    watcher
+        .watch(dir, notify::RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch {dir:?}"))?;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let _watcher = watcher;
+        let mut last_sent_times = std::collections::HashMap::new();
+        while let Ok(res) = rx_raw.recv() {
+            let now = std::time::Instant::now();
+            match res {
+                Ok(ev) => {
+                    for path in ev.paths {
+                        if last_sent_times
+                            .get(&path)
+                            .is_some_and(|&t| (now - t) < min_interval)
+                        {
+                            continue;
+                        }
+                        last_sent_times.insert(path.clone(), now);
+                        if tx.send(Ok(path.clone())).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if tx.send(Err(err)).is_err() {
+                        return;
+                    }
+                }
+            };
+        }
+    });
+
+    Ok(rx)
 }
 
 struct TestRunner {

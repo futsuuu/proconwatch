@@ -1,3 +1,5 @@
+use std::hash::{Hash as _, Hasher as _};
+
 use anyhow::Context as _;
 use crossterm::style::Stylize as _;
 use notify::Watcher as _;
@@ -89,10 +91,13 @@ struct TestRunner {
 impl TestRunner {
     fn new() -> anyhow::Result<Self> {
         let root_directory = std::env::current_dir()?;
-        let bin_directory = std::env::temp_dir().join(env!("CARGO_PKG_NAME"));
-        if bin_directory.try_exists()? {
-            std::fs::remove_dir_all(&bin_directory)?;
-        }
+        let bin_directory = {
+            let mut hasher = std::hash::DefaultHasher::new();
+            root_directory.hash(&mut hasher);
+            std::env::temp_dir()
+                .join(env!("CARGO_PKG_NAME"))
+                .join(format!("{:x}", hasher.finish()))
+        };
         std::fs::create_dir_all(&bin_directory)?;
         Ok(Self {
             root_directory,
@@ -106,30 +111,36 @@ impl TestRunner {
         case: TestCase,
     ) -> anyhow::Result<()> {
         let exe_path = self.get_exe_path(source);
-        if !exe_path.try_exists()? && !compile_cpp(source, &exe_path)? {
+        let compile_result = compile_cpp_if_needed(source, &exe_path)?;
+        if compile_result.is_err() {
+            Log::CompileResult(compile_result).print();
             return Ok(());
         }
         Log::Testing(source.to_path_buf()).print();
-        self.run_test(&exe_path, case).await?;
+        Log::TestResult(self.run_test(&exe_path, case).await?).print();
         Ok(())
     }
 
     async fn run_after_compiling(&self, source: &std::path::Path) -> anyhow::Result<()> {
         let exe_path = self.get_exe_path(source);
-        if !compile_cpp(source, &exe_path)? {
+        let compile_result = compile_cpp_if_needed(source, &exe_path)?;
+        if compile_result.is_err() {
+            Log::CompileResult(compile_result).print();
+            return Ok(());
+        }
+        let test_cases = get_test_cases(source)?;
+        if test_cases.is_empty() {
+            Log::CompileResult(compile_result).print();
             return Ok(());
         }
         Log::Testing(source.to_path_buf()).print();
-        for case in get_test_cases(source)? {
-            self.run_test(&exe_path, case).await?;
+        for case in test_cases {
+            Log::TestResult(self.run_test(&exe_path, case).await?).print();
         }
         Ok(())
     }
 
-    async fn run_test(&self, exe_path: &std::path::Path, case: TestCase) -> anyhow::Result<()> {
-        if !exe_path.try_exists()? {
-            return Ok(());
-        }
+    async fn run_test(&self, exe_path: &std::path::Path, case: TestCase) -> anyhow::Result<TestResult> {
         let mut child = tokio::process::Command::new(exe_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -145,8 +156,8 @@ impl TestRunner {
             .await
             .context("failed to write into stdin")?;
 
-        let mut stdout_rx = create_line_rx(tokio::io::BufReader::new(cstdout));
-        // let mut stderr_rx = create_line_rx(tokio::io::BufReader::new(cstderr));
+        let mut stdout_rx = line_receiver(tokio::io::BufReader::new(cstdout));
+        // let mut stderr_rx = line_receiver(tokio::io::BufReader::new(cstderr));
         let time_limit = std::time::Duration::from_secs(3);
         let wait_result = tokio::time::timeout(time_limit, child.wait()).await;
         let mut stdout_bytes = Vec::new();
@@ -161,28 +172,23 @@ impl TestRunner {
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
         let Ok(exit_status) = wait_result else {
             child.kill().await?;
-            Log::TestResult(TestResult::TimeLimitExceeded { stdout }).print();
-            return Ok(());
+            return Ok(TestResult::TimeLimitExceeded { stdout });
         };
         let status = exit_status.with_context(|| format!("failed to execute {exe_path:?}"))?;
-        if !status.success() {
-            Log::TestResult(TestResult::ExecutionFailed { stdout, status }).print();
-            return Ok(());
-        }
-        if let Some(expected_output) = case.output {
+        Ok(if !status.success() {
+            TestResult::ExecutionFailed { stdout, status }
+        } else if let Some(expected_output) = case.output {
             if stdout_bytes == expected_output.as_bytes() {
-                Log::TestResult(TestResult::AssertionSucceeded).print();
+                TestResult::AssertionSucceeded
             } else {
-                Log::TestResult(TestResult::AssertionFailed {
+                TestResult::AssertionFailed {
                     expected: expected_output,
                     actual: stdout,
-                })
-                .print();
+                }
             }
         } else {
-            Log::TestResult(TestResult::ExecutionSucceeded { stdout }).print();
-        }
-        Ok(())
+            TestResult::ExecutionSucceeded { stdout }
+        })
     }
 
     fn get_exe_path(&self, source: &std::path::Path) -> std::path::PathBuf {
@@ -192,7 +198,7 @@ impl TestRunner {
     }
 }
 
-fn create_line_rx<R>(mut r: R) -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>
+fn line_receiver<R>(mut r: R) -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>
 where
     R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
 {
@@ -215,7 +221,7 @@ where
 
 #[tokio::test]
 async fn test_line_receiver() {
-    let mut rx = create_line_rx(std::io::Cursor::new("hello\nworld\n!"));
+    let mut rx = line_receiver(std::io::Cursor::new("hello\nworld\n!"));
     assert_eq!(
         "hello\n".as_bytes().to_vec(),
         rx.recv().await.unwrap().unwrap()
@@ -347,7 +353,18 @@ fn test_filter_test_cases() {
     );
 }
 
-fn compile_cpp(source: &std::path::Path, out: &std::path::Path) -> anyhow::Result<bool> {
+fn compile_cpp_if_needed(
+    source: &std::path::Path,
+    out: &std::path::Path,
+) -> anyhow::Result<Result<Option<String>, String>> {
+    if let Ok(src_attr) = std::fs::metadata(source)
+        && let Ok(out_attr) = std::fs::metadata(out)
+        && let Ok(src_mtime) = src_attr.modified()
+        && let Ok(out_mtime) = out_attr.modified()
+        && src_mtime < out_mtime
+    {
+        return Ok(Ok(None));
+    }
     Log::Compiling(source.to_path_buf()).print();
     let mut cc = std::process::Command::new("g++");
     cc.args(["-Wall", "-Wextra", "-fdiagnostics-color=always"]);
@@ -360,13 +377,13 @@ fn compile_cpp(source: &std::path::Path, out: &std::path::Path) -> anyhow::Resul
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim().to_string();
-    if !output.status.success() {
-        Log::CompileResult(Err(stderr)).print();
-        return Ok(false);
+    Ok(if !output.status.success() {
+        Err(stderr)
     } else if !stderr.is_empty() {
-        Log::CompileResult(Ok(Some(stderr))).print();
-    }
-    Ok(true)
+        Ok(Some(stderr))
+    } else {
+        Ok(None)
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
